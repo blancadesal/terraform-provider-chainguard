@@ -359,6 +359,13 @@ func newPlatformClients(ctx context.Context, token, consoleAPI string) (platform
 // errorToDiagnostic converts an error into a diag.Diagnostic.
 // If err is a GRPC error, attempt to parse the status code and message from the error.
 // codes.Unauthenticated is handled as a special case to suggest how to generate a token.
+func isNotFound(err error) bool {
+	if s, ok := status.FromError(err); ok {
+		return s.Code() == codes.NotFound
+	}
+	return false
+}
+
 func errorToDiagnostic(err error, summary string) diag.Diagnostic {
 	var d diag.Diagnostic
 

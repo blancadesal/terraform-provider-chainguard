@@ -21,7 +21,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 
-	iam "chainguard.dev/sdk/proto/platform/iam/v1"
+	iamv2 "chainguard.dev/sdk/proto/chainguard/platform/iam/v2beta1"
 	"chainguard.dev/sdk/uidp"
 	"github.com/chainguard-dev/terraform-provider-chainguard/internal/validators"
 )
@@ -149,9 +149,9 @@ func (r *identityProviderResource) ImportState(ctx context.Context, req resource
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
 }
 
-func populateIDP(ctx context.Context, model *identityProviderResourceModel) (*iam.IdentityProvider, error) {
-	idp := &iam.IdentityProvider{
-		Id:          model.ID.ValueString(),
+func populateIDP(ctx context.Context, model *identityProviderResourceModel) (*iamv2.IdentityProvider, error) {
+	idp := &iamv2.IdentityProvider{
+		Uid:         model.ID.ValueString(),
 		Name:        model.Name.ValueString(),
 		Description: model.Description.ValueString(),
 		DefaultRole: model.DefaultRole.ValueString(),
@@ -165,13 +165,13 @@ func populateIDP(ctx context.Context, model *identityProviderResourceModel) (*ia
 		}
 
 		var scopes []string
-		if diags := oidc.AdditionalScopes.ElementsAs(ctx, &scopes, false /* allowUnhandled */); diags.HasError() {
+		if diags := oidc.AdditionalScopes.ElementsAs(ctx, &scopes, false); diags.HasError() {
 			tflog.Error(ctx, fmt.Sprintf("failed to cast additional_scopes from oidc model: %s", diags[0].Detail()))
 			return nil, errors.New("failed to cast additional_scopes from oidc model")
 		}
 
-		idp.Configuration = &iam.IdentityProvider_Oidc{
-			Oidc: &iam.IdentityProvider_OIDC{
+		idp.Configuration = &iamv2.IdentityProvider_Oidc{
+			Oidc: &iamv2.IdentityProvider_OIDC{
 				Issuer:           oidc.Issuer.ValueString(),
 				ClientId:         oidc.ClientID.ValueString(),
 				ClientSecret:     oidc.ClientSecret.ValueString(),
@@ -179,7 +179,6 @@ func populateIDP(ctx context.Context, model *identityProviderResourceModel) (*ia
 			},
 		}
 	} else {
-		// This shouldn't happen with our validation.
 		return nil, errors.New("wanted at least oidc configuration to be set")
 	}
 
@@ -204,9 +203,9 @@ func (r *identityProviderResource) Create(ctx context.Context, req resource.Crea
 
 	// Retry on PermissionDenied to handle eventual consistency when the
 	// parent group was just created in the same apply.
-	idp, err = retryOnPermissionDenied(ctx, func() (*iam.IdentityProvider, error) {
-		return r.prov.client.IAM().IdentityProviders().Create(ctx, &iam.CreateIdentityProviderRequest{
-			ParentId:         plan.ParentID.ValueString(),
+	idp, err = retryOnPermissionDenied(ctx, func() (*iamv2.IdentityProvider, error) {
+		return r.prov.clientV2.IAM().IdentityProvidersService().CreateIdentityProvider(ctx, &iamv2.CreateIdentityProviderRequest{
+			Parent:           plan.ParentID.ValueString(),
 			IdentityProvider: idp,
 		})
 	})
@@ -215,8 +214,7 @@ func (r *identityProviderResource) Create(ctx context.Context, req resource.Crea
 		return
 	}
 
-	// Save identity provider ID in the state.
-	plan.ID = types.StringValue(idp.Id)
+	plan.ID = types.StringValue(idp.GetUid())
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -231,36 +229,28 @@ func (r *identityProviderResource) Read(ctx context.Context, req resource.ReadRe
 	tflog.Info(ctx, fmt.Sprintf("read identity provider request: %s", state.ID))
 
 	id := state.ID.ValueString()
-	idpList, err := r.prov.client.IAM().IdentityProviders().List(ctx, &iam.IdentityProviderFilter{
-		Id: id,
+	idp, err := r.prov.clientV2.IAM().IdentityProvidersService().GetIdentityProvider(ctx, &iamv2.GetIdentityProviderRequest{
+		Uid: id,
 	})
 	if err != nil {
-		resp.Diagnostics.Append(errorToDiagnostic(err, "failed to list identity providers"))
+		if isNotFound(err) {
+			resp.State.RemoveResource(ctx)
+			return
+		}
+		resp.Diagnostics.Append(errorToDiagnostic(err, "failed to get identity provider"))
 		return
 	}
 
-	switch c := len(idpList.GetItems()); {
-	case c == 0:
-		// IdP was deleted outside TF, remove from state
-		resp.State.RemoveResource(ctx)
-		return
-	case c > 1:
-		tflog.Error(ctx, fmt.Sprintf("policy list returned %d policies for id %s", c, id))
-		resp.Diagnostics.AddError("failed to list policy", fmt.Sprintf("more than one policy found matching id %s", id))
-		return
+	state.ID = types.StringValue(idp.GetUid())
+	state.Name = types.StringValue(idp.GetName())
+	if !state.Description.IsNull() || idp.GetDescription() != "" {
+		state.Description = types.StringValue(idp.GetDescription())
 	}
-
-	idp := idpList.GetItems()[0]
-	state.ID = types.StringValue(idp.Id)
-	state.Name = types.StringValue(idp.Name)
-	if !state.Description.IsNull() || idp.Description != "" {
-		state.Description = types.StringValue(idp.Description)
-	}
-	state.DefaultRole = types.StringValue(idp.DefaultRole)
-	state.ParentID = types.StringValue(uidp.Parent(idp.Id))
+	state.DefaultRole = types.StringValue(idp.GetDefaultRole())
+	state.ParentID = types.StringValue(uidp.Parent(idp.GetUid()))
 
 	switch conf := idp.Configuration.(type) {
-	case *iam.IdentityProvider_Oidc:
+	case *iamv2.IdentityProvider_Oidc:
 		scopes, diags := types.ListValueFrom(ctx, types.StringType, conf.Oidc.AdditionalScopes)
 		if diags.HasError() {
 			resp.Diagnostics.Append(diags...)
@@ -317,7 +307,9 @@ func (r *identityProviderResource) Update(ctx context.Context, req resource.Upda
 		return
 	}
 
-	if _, err := r.prov.client.IAM().IdentityProviders().Update(ctx, idp); err != nil {
+	if _, err := r.prov.clientV2.IAM().IdentityProvidersService().UpdateIdentityProvider(ctx, &iamv2.UpdateIdentityProviderRequest{
+		IdentityProvider: idp,
+	}); err != nil {
 		resp.Diagnostics.Append(errorToDiagnostic(err, "failed to update identity provider"))
 		return
 	}
@@ -336,8 +328,8 @@ func (r *identityProviderResource) Delete(ctx context.Context, req resource.Dele
 	tflog.Info(ctx, fmt.Sprintf("delete identity provider request: %s", state.ID))
 
 	id := state.ID.ValueString()
-	_, err := r.prov.client.IAM().IdentityProviders().Delete(ctx, &iam.DeleteIdentityProviderRequest{
-		Id: id,
+	_, err := r.prov.clientV2.IAM().IdentityProvidersService().DeleteIdentityProvider(ctx, &iamv2.DeleteIdentityProviderRequest{
+		Uid: id,
 	})
 	if err != nil {
 		resp.Diagnostics.Append(errorToDiagnostic(err, fmt.Sprintf("failed to delete identity provider %q", id)))

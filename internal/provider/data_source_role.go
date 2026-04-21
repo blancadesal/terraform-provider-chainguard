@@ -11,6 +11,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
@@ -185,6 +186,25 @@ func (d *roleDataSource) Read(ctx context.Context, req datasource.ReadRequest, r
 
 	// Set state
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
+}
+
+func parseCapabilities(ctx context.Context, set types.Set) ([]capabilities.Capability, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	strs := make([]string, 0, len(set.Elements()))
+	diags.Append(set.ElementsAs(ctx, &strs, false)...)
+	if diags.HasError() {
+		return nil, diags
+	}
+	caps := make([]capabilities.Capability, 0, len(strs))
+	for _, s := range strs {
+		c, err := capabilities.Parse(s)
+		if err != nil {
+			diags.AddError("invalid capability", fmt.Sprintf("failed to parse capability %q: %v", s, err))
+			return nil, diags
+		}
+		caps = append(caps, c)
+	}
+	return caps, diags
 }
 
 func capabilityStrings(caps []capabilities.Capability) []string {

@@ -18,7 +18,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 
-	iam "chainguard.dev/sdk/proto/platform/iam/v1"
+	iamv2 "chainguard.dev/sdk/proto/chainguard/platform/iam/v2beta1"
 	"github.com/chainguard-dev/terraform-provider-chainguard/internal/validators"
 )
 
@@ -102,12 +102,12 @@ func (r *rolebindingResource) Create(ctx context.Context, req resource.CreateReq
 
 	// Create the rolebinding. Retry on PermissionDenied to handle eventual
 	// consistency when the parent group was just created in the same apply.
-	binding, err := retryOnPermissionDenied(ctx, func() (*iam.RoleBinding, error) {
-		return r.prov.client.IAM().RoleBindings().Create(ctx, &iam.CreateRoleBindingRequest{
+	binding, err := retryOnPermissionDenied(ctx, func() (*iamv2.RoleBinding, error) {
+		return r.prov.clientV2.IAM().RoleBindingsService().CreateRoleBinding(ctx, &iamv2.CreateRoleBindingRequest{
 			Parent: plan.Group.ValueString(),
-			RoleBinding: &iam.RoleBinding{
-				Identity: plan.Identity.ValueString(),
-				Role:     plan.Role.ValueString(),
+			RoleBinding: &iamv2.RoleBinding{
+				IdentityUid: plan.Identity.ValueString(),
+				RoleUid:     plan.Role.ValueString(),
 			},
 		})
 	})
@@ -116,8 +116,7 @@ func (r *rolebindingResource) Create(ctx context.Context, req resource.CreateReq
 		return
 	}
 
-	// Save binding details in the state.
-	plan.ID = types.StringValue(binding.Id)
+	plan.ID = types.StringValue(binding.GetUid())
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -131,35 +130,24 @@ func (r *rolebindingResource) Read(ctx context.Context, req resource.ReadRequest
 	}
 	tflog.Info(ctx, fmt.Sprintf("read rolebinding request: id=%s", state.ID))
 
-	// Query for the role to update state
 	rbID := state.ID.ValueString()
-	bindingList, err := r.prov.client.IAM().RoleBindings().List(ctx, &iam.RoleBindingFilter{
-		Id: rbID,
+	binding, err := r.prov.clientV2.IAM().RoleBindingsService().GetRoleBinding(ctx, &iamv2.GetRoleBindingRequest{
+		Uid: rbID,
 	})
 	if err != nil {
-		resp.Diagnostics.Append(errorToDiagnostic(err, "failed to list rolebindings"))
+		if isNotFound(err) {
+			resp.State.RemoveResource(ctx)
+			return
+		}
+		resp.Diagnostics.Append(errorToDiagnostic(err, "failed to get rolebinding"))
 		return
 	}
 
-	switch c := len(bindingList.GetItems()); c {
-	case 0:
-		// Role doesn't exist or was deleted outside TF
-		resp.State.RemoveResource(ctx)
-
-	case 1:
-		binding := bindingList.GetItems()[0]
-		state.ID = types.StringValue(binding.Id)
-		state.Group = types.StringValue(binding.Group.Id)
-		state.Identity = types.StringValue(binding.Identity)
-		state.Role = types.StringValue(binding.Role.Id)
-
-		// Set state
-		resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
-
-	default:
-		tflog.Error(ctx, fmt.Sprintf("rolebinding list returned %d bindings for id %q", c, rbID))
-		resp.Diagnostics.AddError("internal error", fmt.Sprintf("fatal data corruption: id %s matched more than one rolebinding", rbID))
-	}
+	state.ID = types.StringValue(binding.GetUid())
+	state.Group = types.StringValue(binding.GetGroup().GetUid())
+	state.Identity = types.StringValue(binding.GetIdentity().GetUid())
+	state.Role = types.StringValue(binding.GetRole().GetUid())
+	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
 // Update updates the resource and sets the updated Terraform state on success.
@@ -172,20 +160,21 @@ func (r *rolebindingResource) Update(ctx context.Context, req resource.UpdateReq
 	}
 	tflog.Info(ctx, fmt.Sprintf("update rolebinding request: id=%s", data.ID))
 
-	binding, err := r.prov.client.IAM().RoleBindings().Update(ctx, &iam.RoleBinding{
-		Id:       data.ID.ValueString(),
-		Identity: data.Identity.ValueString(),
-		Role:     data.Role.ValueString(),
+	binding, err := r.prov.clientV2.IAM().RoleBindingsService().UpdateRoleBinding(ctx, &iamv2.UpdateRoleBindingRequest{
+		RoleBinding: &iamv2.RoleBinding{
+			Uid:         data.ID.ValueString(),
+			IdentityUid: data.Identity.ValueString(),
+			RoleUid:     data.Role.ValueString(),
+		},
 	})
 	if err != nil {
 		resp.Diagnostics.Append(errorToDiagnostic(err, fmt.Sprintf("failed to update rolebinding %q", data.ID.ValueString())))
 		return
 	}
 
-	// Set state
-	data.ID = types.StringValue(binding.Id)
-	data.Identity = types.StringValue(binding.Identity)
-	data.Role = types.StringValue(binding.Role)
+	data.ID = types.StringValue(binding.GetUid())
+	data.Identity = types.StringValue(binding.GetIdentity().GetUid())
+	data.Role = types.StringValue(binding.GetRole().GetUid())
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
@@ -200,8 +189,8 @@ func (r *rolebindingResource) Delete(ctx context.Context, req resource.DeleteReq
 	tflog.Info(ctx, fmt.Sprintf("delete rolebinding request: id=%s", state.ID))
 
 	id := state.ID.ValueString()
-	_, err := r.prov.client.IAM().RoleBindings().Delete(ctx, &iam.DeleteRoleBindingRequest{
-		Id: id,
+	_, err := r.prov.clientV2.IAM().RoleBindingsService().DeleteRoleBinding(ctx, &iamv2.DeleteRoleBindingRequest{
+		Uid: id,
 	})
 	if err != nil {
 		resp.Diagnostics.Append(errorToDiagnostic(err, fmt.Sprintf("failed to delete rolebinding %q", id)))

@@ -20,7 +20,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 
-	iam "chainguard.dev/sdk/proto/platform/iam/v1"
+	iamv2 "chainguard.dev/sdk/proto/chainguard/platform/iam/v2beta1"
 	"chainguard.dev/sdk/uidp"
 	"github.com/chainguard-dev/terraform-provider-chainguard/internal/validators"
 )
@@ -110,19 +110,16 @@ func (r *roleResource) Create(ctx context.Context, req resource.CreateRequest, r
 	}
 	tflog.Info(ctx, fmt.Sprintf("create role request: name=%s, parent_id=%s", plan.Name, plan.ParentID))
 
-	// Create the role.
-	caps := make([]string, 0, len(plan.Capabilities.Elements()))
-	resp.Diagnostics.Append(plan.Capabilities.ElementsAs(ctx, &caps, false /* allowUnhandled */)...)
+	caps, diags := parseCapabilities(ctx, plan.Capabilities)
+	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	// Retry on PermissionDenied to handle eventual consistency when the
-	// parent group was just created in the same apply.
-	role, err := retryOnPermissionDenied(ctx, func() (*iam.Role, error) {
-		return r.prov.client.IAM().Roles().Create(ctx, &iam.CreateRoleRequest{
-			ParentId: plan.ParentID.ValueString(),
-			Role: &iam.Role{
+	role, err := retryOnPermissionDenied(ctx, func() (*iamv2.Role, error) {
+		return r.prov.clientV2.IAM().RolesService().CreateRole(ctx, &iamv2.CreateRoleRequest{
+			Parent: plan.ParentID.ValueString(),
+			Role: &iamv2.Role{
 				Name:         plan.Name.ValueString(),
 				Description:  plan.Description.ValueString(),
 				Capabilities: caps,
@@ -134,8 +131,7 @@ func (r *roleResource) Create(ctx context.Context, req resource.CreateRequest, r
 		return
 	}
 
-	// Save role details in the state.
-	plan.ID = types.StringValue(role.Id)
+	plan.ID = types.StringValue(role.GetUid())
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -149,42 +145,32 @@ func (r *roleResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 	}
 	tflog.Info(ctx, fmt.Sprintf("read role request: %s", state.ID))
 
-	// Query for the role to update state
 	roleID := state.ID.ValueString()
-	roleList, err := r.prov.client.IAM().Roles().List(ctx, &iam.RoleFilter{
-		Id: roleID,
+	role, err := r.prov.clientV2.IAM().RolesService().GetRole(ctx, &iamv2.GetRoleRequest{
+		Uid: roleID,
 	})
 	if err != nil {
-		resp.Diagnostics.Append(errorToDiagnostic(err, "failed to list roles"))
+		if isNotFound(err) {
+			resp.State.RemoveResource(ctx)
+			return
+		}
+		resp.Diagnostics.Append(errorToDiagnostic(err, "failed to get role"))
 		return
 	}
 
-	switch c := len(roleList.GetItems()); c {
-	case 0:
-		// Role doesn't exist or was deleted outside TF
-		resp.State.RemoveResource(ctx)
+	state.ID = types.StringValue(role.GetUid())
+	state.Name = types.StringValue(role.GetName())
+	state.Description = types.StringValue(role.GetDescription())
+	state.ParentID = types.StringValue(uidp.Parent(role.GetUid()))
 
-	case 1:
-		r := roleList.GetItems()[0]
-		state.ID = types.StringValue(r.Id)
-		state.Name = types.StringValue(r.Name)
-		state.Description = types.StringValue(r.Description)
-		state.ParentID = types.StringValue(uidp.Parent(r.Id))
-
-		var diags diag.Diagnostics
-		state.Capabilities, diags = types.SetValueFrom(ctx, types.StringType, r.Capabilities)
-		if diags.HasError() {
-			resp.Diagnostics.Append(diags...)
-			return
-		}
-
-		// Set state
-		resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
-
-	default:
-		tflog.Error(ctx, fmt.Sprintf("role list returned %d roles for id %q", c, roleID))
-		resp.Diagnostics.AddError("internal error", fmt.Sprintf("fatal data corruption: id %s matched more than one role", roleID))
+	var diags diag.Diagnostics
+	state.Capabilities, diags = types.SetValueFrom(ctx, types.StringType, capabilityStrings(role.GetCapabilities()))
+	if diags.HasError() {
+		resp.Diagnostics.Append(diags...)
+		return
 	}
+
+	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
 // Update updates the resource and sets the updated Terraform state on success.
@@ -197,29 +183,29 @@ func (r *roleResource) Update(ctx context.Context, req resource.UpdateRequest, r
 	}
 	tflog.Info(ctx, fmt.Sprintf("update role request: %s", data.ID))
 
-	caps := make([]string, 0, len(data.Capabilities.Elements()))
-	resp.Diagnostics.Append(data.Capabilities.ElementsAs(ctx, &caps, false /* allowUnhandled */)...)
+	caps, diags := parseCapabilities(ctx, data.Capabilities)
+	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	role, err := r.prov.client.IAM().Roles().Update(ctx, &iam.Role{
-		Id:           data.ID.ValueString(),
-		Name:         data.Name.ValueString(),
-		Description:  data.Description.ValueString(),
-		Capabilities: caps,
+	role, err := r.prov.clientV2.IAM().RolesService().UpdateRole(ctx, &iamv2.UpdateRoleRequest{
+		Role: &iamv2.Role{
+			Uid:          data.ID.ValueString(),
+			Name:         data.Name.ValueString(),
+			Description:  data.Description.ValueString(),
+			Capabilities: caps,
+		},
 	})
 	if err != nil {
 		resp.Diagnostics.Append(errorToDiagnostic(err, fmt.Sprintf("failed to update role %q", data.ID.ValueString())))
 		return
 	}
 
-	// Set state
-	var diags diag.Diagnostics
-	data.ID = types.StringValue(role.Id)
+	data.ID = types.StringValue(role.GetUid())
 	data.Name = types.StringValue(role.GetName())
 	data.Description = types.StringValue(role.GetDescription())
-	data.Capabilities, diags = types.SetValueFrom(ctx, types.StringType, role.Capabilities)
+	data.Capabilities, diags = types.SetValueFrom(ctx, types.StringType, capabilityStrings(role.GetCapabilities()))
 	if diags.HasError() {
 		resp.Diagnostics.Append(diags...)
 		return
@@ -238,8 +224,8 @@ func (r *roleResource) Delete(ctx context.Context, req resource.DeleteRequest, r
 	tflog.Info(ctx, fmt.Sprintf("delete role request: %s", state.ID))
 
 	id := state.ID.ValueString()
-	_, err := r.prov.client.IAM().Roles().Delete(ctx, &iam.DeleteRoleRequest{
-		Id: id,
+	_, err := r.prov.clientV2.IAM().RolesService().DeleteRole(ctx, &iamv2.DeleteRoleRequest{
+		Uid: id,
 	})
 	if err != nil {
 		resp.Diagnostics.Append(errorToDiagnostic(err, fmt.Sprintf("failed to delete role %q", id)))
